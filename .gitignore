@@ -1,0 +1,14 @@
+__pycache__/
+*/__pycache__/
+.pytest_cache/
+
+venv/
+
+handout/*.aux
+handout/*.out
+handout/*.log
+
+# Pycharm IDE
+.idea/*
+
+.ipynb_checkpoints/
