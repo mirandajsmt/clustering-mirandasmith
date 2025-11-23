@@ -48,8 +48,12 @@ class FluxEquilibriumClustering:
         epsilon: float = 1e-4,
         beta: Optional[float] = None,
     ) -> None:
-        # Hint: self.k = k, self.sigma = sigma, etc.
-        raise NotImplementedError
+        self.k = k
+        self.sigma = sigma
+        self.alpha = alpha
+        self.T = T
+        self.epsilon = epsilon
+        self.beta = beta
 
     def fit(self, X: np.ndarray) -> "FluxEquilibriumClustering":
         """Compute cluster labels for *X*.
@@ -71,9 +75,227 @@ class FluxEquilibriumClustering:
 
         The final labels must be stored in ``self.labels_``.
         """
-        # Hint: Start with computing centroid = X.mean(axis=0)
-
-        # Add your code here
+        n = X.shape[0]
+        
+        # Step 1: Pre-compute
+        # Compute global centroid
+        centroid = X.mean(axis=0)
+        
+        # Calculate distances from each point to centroid
+        distances = np.linalg.norm(X - centroid, axis=1)
+        
+        # Compute pairwise distances for sigma calculation if needed
+        pairwise_dists = np.linalg.norm(X[:, np.newaxis] - X[np.newaxis, :], axis=2)
+        
+        # Set sigma if not specified
+        if self.sigma is None:
+            # Get upper triangle indices to compute median of pairwise distances
+            upper_tri_i, upper_tri_j = np.triu_indices(n, k=1)
+            median_dist = np.median(pairwise_dists[upper_tri_i, upper_tri_j])
+            sigma = 0.2 * median_dist
+        else:
+            sigma = self.sigma
+        
+        # Set effective k
+        k_eff = min(self.k, n - 1)
+        
+        # Build k-NN graph with exponential weights
+        # Store as (n, k) array with indices and weights
+        knn_indices = np.zeros((n, k_eff), dtype=int)
+        knn_weights = np.zeros((n, k_eff))
+        
+        for i in range(n):
+            # Find k nearest neighbors (excluding self)
+            dists_i = pairwise_dists[i].copy()
+            dists_i[i] = np.inf  # Exclude self
+            nearest_indices = np.argpartition(dists_i, k_eff)[:k_eff]
+            
+            # Sort by distance for consistency
+            nearest_indices = nearest_indices[np.argsort(dists_i[nearest_indices])]
+            
+            # Compute weights
+            weights = np.exp(-(pairwise_dists[i, nearest_indices]**2) / (sigma**2))
+            
+            knn_indices[i] = nearest_indices
+            knn_weights[i] = weights
+        
+        # Store w_ij in sparse format (n, k)
+        w_ij = knn_weights
+        
+        # Step 2: Initialize flux
+        flux = np.ones(n)
+        
+        # Tolerance for relaxed downhill criterion
+        tau = 0.1 * sigma
+        
+        # Step 3: Simulate flow
+        delta = {}  # Store as sparse dict: (i,j) -> delta_ij
+        
+        for t in range(self.T):
+            # Compute flux transport
+            delta = {}
+            
+            for i in range(n):
+                # Get neighbors from knn graph
+                neighbors = knn_indices[i]
+                neighbor_weights = knn_weights[i]
+                
+                # Find downhill neighbors (relaxed criterion)
+                downhill_mask = distances[neighbors] <= distances[i] + tau
+                downhill_neighbors = neighbors[downhill_mask]
+                downhill_weights = neighbor_weights[downhill_mask]
+                
+                if len(downhill_neighbors) > 0:
+                    # Compute flux-aware weights
+                    if t == 0:
+                        w_tilde = downhill_weights
+                    else:
+                        if self.beta is None:
+                            phi_f = np.log(1 + flux[downhill_neighbors])
+                        elif self.beta == 0:
+                            phi_f = np.ones(len(downhill_neighbors))
+                        else:
+                            phi_f = flux[downhill_neighbors] ** self.beta
+                        
+                        w_tilde = downhill_weights * phi_f
+                    
+                    # Compute denominator
+                    denom = np.sum(w_tilde)
+                    
+                    if denom > 0:
+                        # Send flux to each downhill neighbor
+                        for j, w in zip(downhill_neighbors, w_tilde):
+                            delta[(i, j)] = self.alpha * w * flux[i] / denom
+            
+            # Update flux
+            outgoing = np.zeros(n)
+            incoming = np.zeros(n)
+            
+            for (i, j), d in delta.items():
+                outgoing[i] += d
+                incoming[j] += d
+            
+            flux = flux - outgoing + incoming
+        
+        # Step 4: Detect sinks
+        outgoing_flux = np.zeros(n)
+        for (i, j), d in delta.items():
+            outgoing_flux[i] += d
+        
+        sink_indices = np.where(outgoing_flux < self.epsilon)[0]
+        
+        # If no sinks detected, use point closest to centroid
+        if len(sink_indices) == 0:
+            sink_indices = np.array([np.argmin(distances)])
+        
+        # Create boolean array for sinks
+        sinks = np.zeros(n, dtype=int)
+        sinks[sink_indices] = 1
+        
+        # Step 5: Assign clusters with cycle detection
+        labels = -np.ones(n, dtype=int)
+        
+        # Assign labels to sinks
+        sink_list = list(sink_indices)
+        for idx, sink in enumerate(sink_list):
+            labels[sink] = idx
+        
+        # For each non-sink, trace steepest path
+        for i in range(n):
+            if labels[i] >= 0:  # Already labeled (is a sink)
+                continue
+            
+            path = [i]
+            visited = {i}
+            current = i
+            
+            while labels[current] < 0:
+                # Get neighbors from knn graph
+                neighbors = knn_indices[current]
+                
+                # Find downhill neighbors
+                downhill_mask = distances[neighbors] <= distances[current] + tau
+                candidates = neighbors[downhill_mask]
+                
+                if len(candidates) == 0:
+                    # No downhill neighbor, make this a sink
+                    new_sink_label = len(sink_list)
+                    sink_list.append(current)
+                    sinks[current] = 1
+                    labels[current] = new_sink_label
+                    break
+                
+                # Find steepest (max delta from last iteration)
+                max_delta = -1
+                steepest = None
+                for j in candidates:
+                    d = delta.get((current, j), 0)
+                    if d > max_delta:
+                        max_delta = d
+                        steepest = j
+                
+                if steepest is None:
+                    # No outgoing flux, make this a sink
+                    new_sink_label = len(sink_list)
+                    sink_list.append(current)
+                    sinks[current] = 1
+                    labels[current] = new_sink_label
+                    break
+                
+                # Cycle detection
+                if steepest in visited:
+                    # Create new sink at current node
+                    new_sink_label = len(sink_list)
+                    sink_list.append(current)
+                    sinks[current] = 1
+                    labels[current] = new_sink_label
+                    break
+                
+                path.append(steepest)
+                visited.add(steepest)
+                current = steepest
+            
+            # Assign all nodes in path to the terminal sink's cluster
+            terminal_label = labels[current]
+            for node in path:
+                labels[node] = terminal_label
+        
+        # Step 6: Post-processing - merge small clusters
+        s_min = max(2, n // 20)
+        
+        # Count cluster sizes
+        unique_labels = np.unique(labels)
+        cluster_sizes = {label: np.sum(labels == label) for label in unique_labels}
+        
+        # Identify small and large clusters
+        small_clusters = [label for label, size in cluster_sizes.items() if size < s_min]
+        large_clusters = [label for label, size in cluster_sizes.items() if size >= s_min]
+        
+        # Merge small clusters
+        for small_label in small_clusters:
+            if len(large_clusters) == 0:
+                # No large clusters to merge into, keep as is
+                break
+            
+            # Compute centroid of small cluster
+            small_cluster_points = X[labels == small_label]
+            mu_small = small_cluster_points.mean(axis=0)
+            
+            # Find nearest large cluster
+            min_dist = float('inf')
+            nearest_large = None
+            
+            for large_label in large_clusters:
+                large_cluster_points = X[labels == large_label]
+                mu_large = large_cluster_points.mean(axis=0)
+                dist = np.linalg.norm(mu_small - mu_large)
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_large = large_label
+            
+            # Merge small into large
+            labels[labels == small_label] = nearest_large
 
         # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
         # We require you maintain these attributes for testing purpose.
